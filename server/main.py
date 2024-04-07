@@ -4,6 +4,10 @@ import os
 import tempfile
 import wave
 import torch
+import uvicorn
+import argparse
+import edge_tts
+import asyncio
 import numpy as np
 from typing import List
 from pydantic import BaseModel
@@ -21,7 +25,7 @@ device = torch.device("cuda" if os.environ.get("USE_CPU", "0") == "0" else "cpu"
 if not torch.cuda.is_available() and device == "cuda":
     raise RuntimeError("CUDA device unavailable, please use Dockerfile.cpu instead.") 
 
-custom_model_path = os.environ.get("CUSTOM_MODEL_PATH", "/app/tts_models")
+custom_model_path = os.environ.get("CUSTOM_MODEL_PATH", "/root/autodl-tmp/wangyong/models/XTTS-v2")
 
 if os.path.exists(custom_model_path) and os.path.isfile(custom_model_path + "/config.json"):
     model_path = custom_model_path
@@ -137,8 +141,29 @@ def predict_streaming_generator(parsed_input: dict = Body(...)):
 
 @app.post("/tts_stream")
 def predict_streaming_endpoint(parsed_input: StreamingInputs):
+    files = get_files_and_dirs(".")
+    delete_files_and_dirs(".", files)
     return StreamingResponse(
         predict_streaming_generator(parsed_input),
+        media_type="audio/wav",
+    )
+
+class StreamingAzureInputs(BaseModel):
+    text: str
+    voice: str
+    rate: str
+    volume: str
+
+async def azure_stream(text, voice, rate, volume):
+    tts = edge_tts.Communicate(text=text, voice=voice, rate=rate, volume=volume)
+    async for chunk in tts.stream():
+        if chunk["type"] == "audio":
+            yield chunk["data"]
+
+@app.post("/tts_azure_stream")
+async def predict_azure_streaming_endpoint(parsed_input: StreamingAzureInputs):
+    return StreamingResponse(
+        azure_stream(parsed_input.text, parsed_input.voice, parsed_input.rate, parsed_input.volume),
         media_type="audio/wav",
     )
 
@@ -183,3 +208,42 @@ def get_speakers():
 @app.get("/languages")
 def get_languages():
     return config.languages
+
+def get_files_and_dirs(dir):
+    filter_name = ["Dockerfile", "Dockerfile.cpu", "Dockerfile.cuda121", "requirements.txt", "requirements_cpu.txt", "__pycache__", "xtts_v2_main.py"]
+    files_and_dirs = []
+    for file_or_dir in os.listdir(dir):
+        if file_or_dir not in filter_name:
+            files_and_dirs.append(file_or_dir)
+
+    return files_and_dirs
+
+def delete_files_and_dirs(dir, names):
+    for name in names:
+        path = os.path.join(dir, name)
+        if os.path.isfile(path):
+            os.remove(path)
+        elif os.path.isdir(path):
+            os.rmdir(path)
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--host",
+    type=str,
+    default="127.0.0.1",
+    help="Service listening IP"
+)
+parser.add_argument(
+    "--port",
+    type=int,
+    default=9001,
+    help="Service listening port"
+)
+parser.add_argument(
+    "--workers",
+    type=int,
+    default=1,
+    help="Workers number"
+)
+args = parser.parse_args()
+uvicorn.run(app, host=args.host, port=args.port, workers=args.workers)
